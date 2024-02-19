@@ -1,6 +1,8 @@
 import os
 import time
 from PIL import Image
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import radians, cos, sin
 
 
@@ -56,10 +58,13 @@ class Blender:
                  frame_count,
                  object_name="HGTarget",
                  camera_name="HGCamera",
-                 camera_dimension=600):
+                 camera_dimension=600,
+                 render=True):
 
         self.object_name = object_name
         self.camera_name = camera_name
+
+        self.render = render
 
         self.frame_count = frame_count
         self.out_path = out_path
@@ -90,8 +95,12 @@ class Blender:
         if type(bpy) == DummyBPY:
             print(f"Dummy BPY camera move: {angle_right}, {angle_up}")
             return
+        if not self.render:
+            return
+
         # print(angle_right, angle_up, distance)
         distance = distance if distance else (self.camera.location - self.object.location).length
+        print(f"Cam to obj distance: {distance}")
 
         angle_right = angle_right if angle_right > 0 else (360-abs(angle_right))    
         angle_up = angle_up if angle_up > 0 else (360-abs(angle_up))
@@ -149,7 +158,8 @@ class Blender:
         print(f"   XY Dimension: {self.dimension}\n\n")
         self.scene.render.pixel_aspect_x = 1
         self.scene.render.pixel_aspect_y = 1
-        bpy.ops.render.render(write_still=True)
+        if self.render:
+            bpy.ops.render.render(write_still=True)
         print(f"Render of frame {self._frame_index} of {self.frame_count} complete\n\n")
         self._frame_index += 1
 
@@ -173,13 +183,30 @@ class HogelProcessor:
 
             # print(offset)
 
-            image = Image.open(v['file'])
+            image = v['image'].copy()
             image = image.resize((resize, resize))
             out_image.paste(image, offset)
         out_filepath = os.path.join(self.hogen.out_path, 'preview.png')
         out_image.save(out_filepath, 'PNG')
 
         print(f"Wrote out preview: {out_filepath}")
+
+    def _generate_hogel(self, x, y):
+        out_filepath = os.path.join(self.hogen.out_path, "hogel_out", f'hogel_{x}_{y}.bmp')
+        if os.path.exists(out_filepath):
+            print(f"Already rendered {out_filepath}. Loading instead")
+            image = Image.open(out_filepath)
+            return (image, x, y)
+        else:
+            print(f"Rendering hogel for pixel position ({x}, {y})")
+            image = Image.new('RGB', (self.hogen.image_count_xy, self.hogen.image_count_xy))
+            image_pixmap = image.load()
+            for k, v in sorted(self.hogen.grid.items()):
+                image_pixmap[k[0], k[1]] = v['image'].load()[x, y]
+            # image.save(out_filepath, 'BMP')
+            print(f"Render of hogel at pixel position ({x}, {y}) completed")
+            return (image, x, y)
+
 
 class Hogen:
     def __init__(self,
@@ -189,19 +216,25 @@ class Hogen:
                  image_count_xy=100,
                  init_elev=30,
                  init_azi=45,
-                 init_dist=10,
-                 out_path="C:\\hogel\\"):
+                 init_dist=None,
+                 out_path="C:\\hogel\\",
+                 render=True):
 
         self.slm_dimension = slm_dimension
         self.incident_angle = incident_angle
         self.image_count_xy = image_count_xy
         self.out_path = out_path
+        self.render = render
 
         self.init_elev = float(init_elev)
         self.init_azi = float(init_azi)
-        self.init_dist = float(init_dist)
 
-        self.blender = Blender(out_path, self.image_count_xy * self.image_count_xy)
+        self.blender = Blender(out_path, self.image_count_xy * self.image_count_xy, render=self.render)
+
+        if init_dist:
+            self.init_dist = float(init_dist)
+        else:
+            self.init_dist = (self.blender.camera.location - self.blender.object.location).length
 
         self._configure_camera()
 
@@ -215,6 +248,8 @@ class Hogen:
 
         self.hogel_processor.generate_preview()
 
+        self._render_hogels()
+
     def _configure_camera(self):
         if type(bpy) != DummyBPY:
             self.blender.lock_camera_to_object()
@@ -224,9 +259,39 @@ class Hogen:
         else:
             print("Dummy BPY _configure_camera")
 
+    def _render_hogels(self):
+        start_time = time.time()
+        print(f"Starting render out of all hogels at {start_time}")
+        def render_and_close(x, y):
+            hogel = self.hogel_processor._generate_hogel(x, y)
+            return hogel
+
+        full_hogel_lock = Lock()
+        full_hogel_map = Image.new('RGB', (self.slm_dimension * self.image_count_xy, self.slm_dimension * self.image_count_xy))
+
+        with ThreadPoolExecutor(max_workers=64) as tpe:
+            futures = []
+
+            for x in range(self.slm_dimension):
+                for y in range(self.slm_dimension):
+                    futures.append(tpe.submit(render_and_close, x=x, y=y))
+
+            for future in as_completed(futures):
+                result = future.result()
+                with full_hogel_lock:
+                    full_hogel_map.paste(result[0], (result[1] * self.image_count_xy, result[2] * self.image_count_xy))
+
+        sized_hogel = full_hogel_map.copy()
+        sized_hogel = sized_hogel.resize((int(full_hogel_map.size[0] / 2), int(full_hogel_map.size[1] / 2)))
+        sized_hogel.save(os.path.join(self.out_path, 'sized_hogel_map.bmp'), 'BMP')
+        full_hogel_map.save(os.path.join(self.out_path, 'full_hogel.bmp'), 'BMP')
+        duration = round(time.time() - start_time)
+        print(f"Full render complete. Took: {duration} seconds, {duration / 60} minutes.")
+
+
     def _render_images(self):
         print("Starting image renders\n\n")
-
+        
         gen_file_list = []
 
         avg_render_time = None
@@ -234,7 +299,7 @@ class Hogen:
 
         for index, data in sorted(self.grid.items()):
             render_start = time.time()
-            self.blender.move_camera_to_angle(data['angles']['az'], data['angles']['el'], distance=self.init_dist)
+            self.blender.move_camera_to_angle(data['angles']['az'], data['angles']['el'], offset_right=-90, distance=self.init_dist)
             self.blender.render_file(index[0], index[1], data['angles']['az'], data['angles']['el'])
             render_end = time.time()
             duration = render_end - render_start
@@ -244,6 +309,7 @@ class Hogen:
             est_time_remain = ((len(self.grid) - current_frame) * avg_render_time)
             print(f"+++ Remaining - Frames: {len(self.grid) - current_frame}, Time: ~{est_time_remain} seconds")
             self.grid[index]['file'] = self.blender.scene.render.filepath
+            self.grid[index]['image'] = Image.open(self.grid[index]['file']).copy()
             gen_file_list.append((index, self.blender.scene.render.filepath))
             current_frame += 1
 
@@ -265,8 +331,8 @@ class Hogen:
         el_start = constrain_360(ie-(ia/2))
         el_end = constrain_360(ie+(ia/2))
         
-        az_start = constrain_360(iaz-(ia/2))
-        az_end = constrain_360(iaz+(ia/2))
+        az_start = constrain_360(iaz+(ia/2))
+        az_end = constrain_360(iaz-(ia/2))
 
         print("Angle grid generation params:\n"
               "  Elevation:\n"
@@ -292,7 +358,8 @@ class Hogen:
                         'az': _remap(index_az, 0, self.image_count_xy-1, az_end, az_start),
                         'el': _remap(index_el, 0, self.image_count_xy-1, el_end, el_start)
                     },
-                    'file': ''
+                    'file': '',
+                    'image': ''
                 }
                 print_nonew(str(self.grid[coord]['angles']).ljust(16))
             print()
@@ -302,6 +369,6 @@ class Hogen:
 
 
 start_time = time.time()
-hogen = Hogen(None, init_elev=0, init_azi=0, image_count_xy=40, incident_angle=135)
+hogen = Hogen(None, init_elev=0, init_azi=0, image_count_xy=40, incident_angle=60, render=True)
 duration = time.time() - start_time
 print(f"--- Took {duration} seconds ({duration / 60} min)")
